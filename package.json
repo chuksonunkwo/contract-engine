@@ -1,0 +1,17 @@
+{
+  "name": "contract-engine-core",
+  "version": "1.0.0",
+  "description": "The AI Co-Pilot for Independent Oil & Gas Consultants",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/chuksonunkwo/contract-engine"
+  },
+  "dependencies": {
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "lucide-react": "^0.263.1",
+    "@google/genai": "^0.1.0",
+    "react-markdown": "^8.0.7",
+    "remark-gfm": "^3.0.1"
+  }
+}
