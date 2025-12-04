@@ -7,56 +7,56 @@ from openai import OpenAI
 
 
 # =========================================================
-# 1) OUTPUT MODELS – MATCH YOUR NEW SCHEMA
+# 1) OUTPUT MODELS – SCHEMA
 # =========================================================
 
-RiskLevel = Literal["High", "Medium", "Low"]
+RiskLevel = Literal["High", "Medium", "Low", "Unknown"]
 DecisionRecommendation = Literal[
     "approve", "approve_with_conditions", "renegotiate", "do_not_approve"
 ]
 
 
 class KeyCommercials(BaseModel):
-    value: Optional[str]        # e.g. "USD 5,000,000"
-    duration: Optional[str]     # e.g. "3 years firm + 2 x 1-year options"
-    contractType: Optional[str] # e.g. "Frame Agreement", "Call-off", "Lump Sum"
-    pricingModel: Optional[str] # e.g. "Lump Sum", "Time & Materials", "Rate-based"
-    renewalTerms: Optional[str] # e.g. "Auto-renewal unless terminated with 90 days' notice"
+    value: Optional[str]
+    duration: Optional[str]
+    contractType: Optional[str]
+    pricingModel: Optional[str]
+    renewalTerms: Optional[str]
 
 
 class RiskMatrixItem(BaseModel):
     category: Literal["Liability", "HSE", "Payment", "Termination", "Legal"]
     riskLevel: RiskLevel
-    description: str            # Short McKinsey-style "so what" statement
-    mitigation: Optional[str]   # Short recommended mitigation / countermeasure
+    description: str
+    mitigation: Optional[str]
 
 
 class ScopeInfo(BaseModel):
-    pricingModel: Optional[str]       # Short description of pricing model
-    paymentTerms: Optional[str]       # e.g. "30 days from invoice; milestone-based"
-    deliverables: List[str]           # Bullet list of key deliverables / services
+    pricingModel: Optional[str]
+    paymentTerms: Optional[str]
+    deliverables: List[str]
 
 
 class ComplianceInfo(BaseModel):
-    summary: str                      # One-paragraph synthesis of compliance posture
+    summary: str
     overallComplianceRisk: Literal["High", "Medium", "Low", "Unknown"]
-    sanctionsFlags: List[str]         # Any red/orange flags re: sanctions/trade restrictions
-    adverseMedia: List[str]           # Lawsuits, corruption, major failures, etc.
-    financialSignals: List[str]       # Any financial health observations (even if inferred)
+    sanctionsFlags: List[str]
+    adverseMedia: List[str]
+    financialSignals: List[str]
 
 
 class AnalysisResult(BaseModel):
     overallRisk: RiskLevel
     keyCommercials: KeyCommercials
-    executiveSummary: List[str]       # 3–5 BLUF bullets (Markdown-style, each starting with "- ")
+    executiveSummary: List[str]
     riskMatrix: List[RiskMatrixItem]
     scope: ScopeInfo
     compliance: ComplianceInfo
-    detailedAnalysis: str             # Markdown deep-dive
+    detailedAnalysis: str
 
 
 # =========================================================
-# 2) SYSTEM PROMPT – YOUR STYLE & ROLE
+# 2) SYSTEM PROMPT
 # =========================================================
 
 SYSTEM_PROMPT = """
@@ -69,7 +69,7 @@ Your responsibilities:
 - Maintain strict JSON formatting as requested by the user prompt.
 - Think like a senior commercial, legal, and procurement professional.
 
-STYLE & QUALITY RULES (McKinsey Style):
+STYLE & QUALITY RULES:
 - Synthesis over summary (always explain “so what?” and business impact).
 - Active voice only (e.g., “Contractor bears full liability.”).
 - Strict bullet points: each item on a new line with a hyphen (-).
@@ -78,13 +78,13 @@ STYLE & QUALITY RULES (McKinsey Style):
 
 STRUCTURED OUTPUT EXPECTATIONS:
 You must populate all fields of the required JSON schema:
-- overallRisk (High, Medium, Low)
+- overallRisk (High, Medium, Low, or Unknown if genuinely unclear)
 - keyCommercials (value, duration, contractType, pricingModel, renewalTerms)
-- executiveSummary (3–5 McKinsey-style BLUF bullets, each starting with a hyphen)
-- riskMatrix (array of risk items with categories: Liability, HSE, Payment, Termination, Legal)
+- executiveSummary (3–5 BLUF bullets, each starting with a hyphen)
+- riskMatrix (array of risk items with categories: Liability, HSE, Payment, Termination, Legal, with riskLevel High/Medium/Low/Unknown)
 - scope (pricing model, payment terms, deliverables)
 - compliance (sanctions, adverse media, financial signals, overallComplianceRisk)
-- detailedAnalysis (Markdown deep-dive using McKinsey-style headings)
+- detailedAnalysis (Markdown deep-dive using the required headings)
 
 DETAILED ANALYSIS FORMAT (Markdown):
 You MUST structure the deep-dive using the following sections:
@@ -129,7 +129,7 @@ def get_openai_client() -> OpenAI:
 
 
 # =========================================================
-# 4) CORE FUNCTION – ONE CALL, STRUCTURED OUTPUT
+# 4) CORE FUNCTION
 # =========================================================
 
 def analyze_contract(
@@ -138,14 +138,8 @@ def analyze_contract(
     deal_context: Optional[str] = None,
 ) -> AnalysisResult:
     """
-    Call OpenAI once and ask it to produce a JSON object with your schema:
-      - overallRisk
-      - keyCommercials
-      - executiveSummary
-      - riskMatrix
-      - scope
-      - compliance
-      - detailedAnalysis
+    Call OpenAI once and ask it to produce a JSON object with your schema.
+    If the JSON is malformed, do a second "repair" call.
     """
 
     client = get_openai_client()
@@ -165,7 +159,7 @@ Contract text:
 Return ONE JSON object with this exact structure (field names and types):
 
 {{
-  "overallRisk": "High | Medium | Low",
+  "overallRisk": "High | Medium | Low | Unknown",
   "keyCommercials": {{
     "value": "string or null",
     "duration": "string or null",
@@ -181,7 +175,7 @@ Return ONE JSON object with this exact structure (field names and types):
   "riskMatrix": [
     {{
       "category": "Liability | HSE | Payment | Termination | Legal",
-      "riskLevel": "High | Medium | Low",
+      "riskLevel": "High | Medium | Low | Unknown",
       "description": "string",
       "mitigation": "string or null"
     }}
@@ -211,21 +205,60 @@ Rules:
     response = client.chat.completions.create(
         model="gpt-4.1-mini",
         temperature=0.2,
-        max_tokens=1600,
+        max_tokens=2000,
+        response_format={"type": "json_object"},
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": user_prompt},
         ],
     )
 
-    content = response.choices[0].message.content
+    content = (response.choices[0].message.content or "").strip()
 
+    # ------------------------------------------------------------------
+    # 1st attempt: normal JSON parse
+    # ------------------------------------------------------------------
+    data = None
     try:
         data = json.loads(content)
-    except json.JSONDecodeError as e:
-        raise ValueError(
-            f"Failed to parse OpenAI response as JSON: {e}\n\nRaw content:\n{content}"
-        )
+    except json.JSONDecodeError:
+        # ------------------------------------------------------------------
+        # 2nd attempt: tolerant parser
+        # ------------------------------------------------------------------
+        try:
+            decoder = json.JSONDecoder(strict=False)
+            data = decoder.decode(content)
+        except json.JSONDecodeError:
+            # ------------------------------------------------------------------
+            # 3rd attempt: call model again to "repair" the JSON
+            # ------------------------------------------------------------------
+            repair_prompt = f"""
+You are a JSON repair assistant.
+
+You will receive malformed JSON that is supposed to follow the contract analysis schema you already know.
+Your task is to output a corrected JSON object that:
+- Is valid JSON.
+- Matches the expected schema and field names.
+- Does not contain any markdown fences or extra commentary.
+
+Malformed JSON:
+```json
+{content}
+```"""
+
+            repair_response = client.chat.completions.create(
+                model="gpt-4.1-mini",
+                temperature=0.0,
+                max_tokens=2000,
+                response_format={"type": "json_object"},
+                messages=[
+                    {"role": "system", "content": "You repair JSON to be valid and schema-compliant."},
+                    {"role": "user", "content": repair_prompt},
+                ],
+            )
+
+            repaired = (repair_response.choices[0].message.content or "").strip()
+            data = json.loads(repaired)
 
     # Map JSON into Pydantic models
     result = AnalysisResult(
