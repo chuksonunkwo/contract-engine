@@ -1,762 +1,457 @@
-import os
+# app_streamlit.py
+
 import io
-from typing import Optional, Tuple, Dict, List
+import os
+from typing import Optional
 
 import streamlit as st
-import pandas as pd
-import requests
-from pypdf import PdfReader
-from docx import Document
 
-from engine import analyze_contract, AnalysisResult
+from engine import AnalysisResult, analyze_contract, validate_license
 
+# ===========================
+# Basic page config & styles
+# ===========================
 
-# ---------------------------------------------------------
-# Gumroad license verification
-# ---------------------------------------------------------
-GUMROAD_PRODUCT_ID = os.getenv("GUMROAD_PRODUCT_ID")  # preferred
-GUMROAD_PRODUCT_PERMALINK = os.getenv("GUMROAD_PRODUCT_PERMALINK")  # fallback
+st.set_page_config(
+    page_title="Contract Engine – Oil & Gas Edition",
+    layout="wide",
+)
 
-
-def gumroad_license_enforced() -> bool:
-    return bool(GUMROAD_PRODUCT_ID or GUMROAD_PRODUCT_PERMALINK)
-
-
-def verify_license(license_key: str) -> Tuple[bool, str, Dict]:
-    """
-    Verify a Gumroad license key.
-
-    If GUMROAD_PRODUCT_ID or GUMROAD_PRODUCT_PERMALINK is NOT configured,
-    this function returns (True, dev-message, {}) so you can test locally.
-    """
-    license_key = (license_key or "").strip()
-
-    if not gumroad_license_enforced():
-        return (
-            True,
-            "License check is in development mode (no Gumroad product configured).",
-            {},
-        )
-
-    if not license_key:
-        return False, "Please enter a license key.", {}
-
-    payload: Dict[str, str] = {
-        "license_key": license_key,
-        "increment_uses_count": "true",
-    }
-
-    if GUMROAD_PRODUCT_ID:
-        payload["product_id"] = GUMROAD_PRODUCT_ID
-    else:
-        payload["product_permalink"] = GUMROAD_PRODUCT_PERMALINK
-
-    try:
-        resp = requests.post(
-            "https://api.gumroad.com/v2/licenses/verify",
-            data=payload,
-            timeout=10,
-        )
-        data = resp.json()
-    except Exception as e:
-        return False, f"Error contacting license server: {e}", {}
-
-    if not data.get("success"):
-        return False, data.get("message", "License verification failed."), data
-
-    purchase = data.get("purchase", {}) or {}
-
-    if purchase.get("refunded") or purchase.get("chargebacked") or purchase.get(
-        "disputed"
-    ):
-        return False, "This license has been refunded or chargebacked.", data
-
-    if purchase.get("subscription_cancelled") or purchase.get(
-        "subscription_ended"
-    ):
-        return False, "This subscription has been cancelled or ended.", data
-
-    return True, "License verified successfully.", data
-
-
-# ---------------------------------------------------------
-# Simple check for API key
-# ---------------------------------------------------------
-def ensure_api_key() -> Optional[str]:
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        st.error(
-            "OPENAI_API_KEY is not set.\n\n"
-            "Locally, set it before running Streamlit, e.g. in PowerShell:\n"
-            "$env:OPENAI_API_KEY = 'your_key_here'\n\n"
-            "On Render, set it in the Environment Variables panel."
-        )
-        return None
-    return api_key
-
-
-# ---------------------------------------------------------
-# File text extraction helpers
-# ---------------------------------------------------------
-def extract_text_from_pdf(uploaded_file) -> str:
-    reader = PdfReader(uploaded_file)
-    text_chunks: List[str] = []
-    for page in reader.pages:
-        try:
-            page_text = page.extract_text() or ""
-        except Exception:
-            page_text = ""
-        if page_text:
-            text_chunks.append(page_text)
-    return "\n\n".join(text_chunks)
-
-
-def extract_text_from_docx(uploaded_file) -> str:
-    doc = Document(uploaded_file)
-    paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
-    return "\n\n".join(paragraphs)
-
-
-def extract_text_from_txt(uploaded_file) -> str:
-    raw_bytes = uploaded_file.read()
-    try:
-        return raw_bytes.decode("utf-8")
-    except UnicodeDecodeError:
-        return raw_bytes.decode("latin-1", errors="ignore")
-
-
-def handle_file_upload() -> Tuple[Optional[str], Optional[str]]:
-    uploaded_file = st.file_uploader(
-        "Upload contract file (PDF, DOCX, or TXT)",
-        type=["pdf", "docx", "txt"],
-        help="For large files, analysis may take longer.",
-    )
-
-    if not uploaded_file:
-        return None, None
-
-    filename = uploaded_file.name.lower()
-    try:
-        if filename.endswith(".pdf"):
-            text = extract_text_from_pdf(uploaded_file)
-            status = f"Extracted text from PDF file: {uploaded_file.name}"
-        elif filename.endswith(".docx"):
-            text = extract_text_from_docx(uploaded_file)
-            status = f"Extracted text from DOCX file: {uploaded_file.name}"
-        elif filename.endswith(".txt"):
-            text = extract_text_from_txt(uploaded_file)
-            status = f"Read text from TXT file: {uploaded_file.name}"
-        else:
-            st.error("Unsupported file type.")
-            return None, None
-
-        if not text.strip():
-            st.warning("No readable text was extracted from the file.")
-            return None, status
-
-        return text, status
-
-    except Exception as e:
-        st.error(f"Error while extracting text from file: {e}")
-        return None, None
-
-
-# ---------------------------------------------------------
-# Layout helpers
-# ---------------------------------------------------------
-def inject_css():
-    st.markdown(
-        """
+CUSTOM_CSS = """
 <style>
-.report-container {
-    max-width: 1200px;
-    margin-left: auto;
-    margin-right: auto;
+/* Main title */
+.contract-title {
+    font-size: 40px;
+    font-weight: 700;
+    margin-bottom: 0.1rem;
 }
+
+/* Subheading under title */
+.contract-subtitle {
+    font-size: 13px;
+    color: #6c757d;
+    margin-bottom: 1.5rem;
+}
+
+/* Card styling for top summary tiles */
 .ce-card {
-    background-color: #f8fafc;
-    border-radius: 20px;
-    padding: 20px 22px;
-    border: 1px solid #e2e8f0;
-    box-shadow: 0 6px 18px rgba(15, 23, 42, 0.03);
+    border-radius: 12px;
+    padding: 1.2rem 1.5rem;
+    border: 1px solid #e5e7eb;
+    background: #ffffff;
+    box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
 }
-.ce-card-hero {
-    background: linear-gradient(135deg, #f973160f, #f9731605);
-}
-.ce-pill {
-    display: inline-block;
-    padding: 4px 10px;
-    border-radius: 999px;
-    font-size: 0.7rem;
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
-}
-.ce-pill-risk-high {
-    background-color: #fee2e2;
-    color: #b91c1c;
-}
-.ce-pill-risk-medium {
-    background-color: #fef3c7;
-    color: #92400e;
-}
-.ce-pill-risk-low {
-    background-color: #dcfce7;
+
+/* Risk level badges */
+.badge-low {
+    background-color: #ecfdf5;
     color: #166534;
-}
-.ce-pill-risk-unknown {
-    background-color: #e5e7eb;
-    color: #4b5563;
-}
-.ce-label {
-    font-size: 0.75rem;
-    font-weight: 700;
-    text-transform: uppercase;
-    letter-spacing: 0.06em;
-    color: #94a3b8;
-    margin-bottom: 6px;
-}
-.ce-risk-title {
-    font-size: 2.4rem;
-    font-weight: 800;
-    margin-bottom: 4px;
-    color: #b45309;
-}
-.ce-metric-title {
-    font-size: 0.85rem;
+    border-radius: 999px;
+    padding: 0.1rem 0.6rem;
+    font-size: 12px;
     font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.06em;
-    color: #94a3b8;
-    margin-bottom: 8px;
 }
-.ce-metric-value {
-    font-size: 1rem;
+.badge-medium {
+    background-color: #fffbeb;
+    color: #92400e;
+    border-radius: 999px;
+    padding: 0.1rem 0.6rem;
+    font-size: 12px;
     font-weight: 600;
-    color: #0f172a;
 }
-.ce-section-title {
-    font-size: 1.1rem;
+.badge-high {
+    background-color: #fef2f2;
+    color: #b91c1c;
+    border-radius: 999px;
+    padding: 0.1rem 0.6rem;
+    font-size: 12px;
+    font-weight: 600;
+}
+
+/* Section titles */
+.section-title {
+    font-size: 22px;
     font-weight: 700;
-    margin-bottom: 8px;
+    margin-top: 1.5rem;
 }
-.ce-section-caption {
-    font-size: 0.85rem;
-    color: #64748b;
-}
-.ce-risk-card {
-    border-left-width: 4px;
-    border-left-style: solid;
-}
-.ce-risk-border-high {
-    border-left-color: #ef4444;
-}
-.ce-risk-border-medium {
-    border-left-color: #f59e0b;
-}
-.ce-risk-border-low {
-    border-left-color: #22c55e;
-}
-.ce-risk-border-unknown {
-    border-left-color: #9ca3af;
+
+/* Small muted label */
+.label-muted {
+    font-size: 12px;
+    color: #6b7280;
 }
 </style>
-        """,
-        unsafe_allow_html=True,
-    )
+"""
+
+st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 
 
-def render_header():
-    st.set_page_config(
-        page_title="Contract Engine",
-        page_icon="📑",
-        layout="wide",
-    )
-    # Safely get license owner from session state
-    license_owner = None
-    if "license_owner" in st.session_state:
-        license_owner = st.session_state.license_owner
+# ===========================
+# Session helpers
+# ===========================
 
-    html = (
-        "<div style='margin-bottom:4px;'>"
-        "<span style='font-size:40px;font-weight:700;'>📑 Contract Engine</span>"
-        "</div>"
-    )
-    if license_owner:
-        html += (
-            f"<div style='font-size:12px;color:#6b7280;'>"
-            f"Licensed to: {license_owner}"
-            f"</div>"
-        )
+if "license_ok" not in st.session_state:
+    st.session_state.license_ok = False
+    st.session_state.license_message = "Enter your Gumroad license key to unlock."
+    st.session_state.last_key = ""
 
-    st.markdown(html, unsafe_allow_html=True)
+if "analysis_result" not in st.session_state:
+    st.session_state.analysis_result = None
+    st.session_state.analysis_error = None
 
 
-def init_session_state():
-    if "license_valid" not in st.session_state:
-        st.session_state.license_valid = False
-        st.session_state.license_message = "License not validated."
-        st.session_state.license_key = ""
-        st.session_state.license_owner = None
+# ===========================
+# Utility: file text extraction
+# ===========================
+
+def _read_pdf(file) -> str:
+    try:
+        import pypdf  # type: ignore
+    except Exception:
+        try:
+            import PyPDF2 as pypdf  # type: ignore
+        except Exception:
+            return "Unable to import PDF library. Please install 'pypdf' or 'PyPDF2'."
+
+    reader = pypdf.PdfReader(file)
+    pages = []
+    for page in reader.pages:
+        try:
+            pages.append(page.extract_text() or "")
+        except Exception:
+            continue
+    return "\n\n".join(pages)
 
 
-def render_sidebar() -> Dict:
-    init_session_state()
+def _read_docx(file) -> str:
+    try:
+        import docx  # python-docx  # type: ignore
+    except Exception:
+        return "Unable to import 'python-docx'. Please install it to read DOCX files."
 
-    # License section
-    st.sidebar.header("License")
+    doc = docx.Document(file)
+    return "\n".join(p.text for p in doc.paragraphs)
 
-    license_key_input = st.sidebar.text_input(
+
+def extract_text_from_upload(uploaded_file) -> str:
+    if uploaded_file is None:
+        return ""
+
+    suffix = (uploaded_file.name or "").lower()
+    if suffix.endswith(".pdf"):
+        return _read_pdf(uploaded_file)
+    if suffix.endswith(".docx"):
+        return _read_docx(uploaded_file)
+    # Fallback – assume text
+    try:
+        return uploaded_file.read().decode("utf-8", errors="ignore")
+    except Exception:
+        return ""
+
+
+# ===========================
+# Sidebar – license & inputs
+# ===========================
+
+with st.sidebar:
+    st.markdown("#### License")
+    license_key = st.text_input(
         "Gumroad license key",
-        value=st.session_state.license_key,
         type="password",
-        help="Paste the license key from your Gumroad receipt.",
+        value=st.session_state.last_key,
     )
-
-    if st.sidebar.button("Validate License"):
-        ok, msg, meta = verify_license(license_key_input)
-        st.session_state.license_valid = ok
+    if st.button("Validate License"):
+        ok, msg = validate_license(license_key)
+        st.session_state.license_ok = ok
         st.session_state.license_message = msg
-        st.session_state.license_key = license_key_input
+        st.session_state.last_key = license_key
 
-        # Extract customer email from Gumroad response when available
-        owner_email = None
-        if ok and meta:
-            purchase = meta.get("purchase") or {}
-            owner_email = purchase.get("email")
-        st.session_state.license_owner = owner_email if owner_email else None
-
-    if st.session_state.license_valid:
-        st.sidebar.success(st.session_state.license_message)
+    # Status message
+    if st.session_state.license_ok:
+        st.success(st.session_state.license_message)
     else:
-        if gumroad_license_enforced():
-            st.sidebar.warning(st.session_state.license_message)
-        else:
-            # Dev mode: softer hint only
-            st.sidebar.caption(
-                "License enforcement is disabled in this environment "
-                "(no Gumroad product configured)."
-            )
+        st.warning(st.session_state.license_message)
 
-    st.sidebar.markdown("---")
-    st.sidebar.header("Input Settings")
+    st.markdown("---")
+    st.markdown("#### Input Settings")
 
-    party_role = st.sidebar.selectbox(
-        "Your role in this contract",
-        options=["buyer", "vendor"],
-        index=0,
-    )
+    role = st.selectbox("Your role in this contract", ["buyer", "vendor"])
 
-    st.sidebar.markdown("---")
-    st.sidebar.subheader("Input Mode")
-    input_mode = st.sidebar.radio(
+    st.markdown("#### Input Mode")
+    input_mode = st.radio(
         "Choose how to provide the contract",
-        options=["Paste text", "Upload file"],
+        ["Paste text", "Upload file"],
         index=0,
     )
 
-    st.sidebar.markdown("---")
-    show_json = st.sidebar.checkbox(
-        "Show raw JSON output (advanced)", value=False
+    show_raw_json = st.checkbox(
+        "Show raw JSON output (advanced)",
+        value=False,
     )
 
-    run_button = st.sidebar.button("Run Analysis 💼")
-
-    st.sidebar.markdown("---")
-    st.sidebar.subheader("Notes")
-    st.sidebar.markdown(
-        "- Paste contract text or upload a file (PDF/DOCX/TXT).\n"
-        "- Output is structured for dashboards and reports.\n"
-        "- Zero-Retention Policy – AI co-pilot, not a law firm. "
-        "Results should be verified by a qualified attorney."
-    )
-
-    return {
-        "party_role": party_role,
-        "input_mode": input_mode,
-        "run_button": run_button,
-        "show_json": show_json,
-    }
-
-
-def render_input_area(input_mode: str) -> str:
-    if input_mode == "Upload file":
-        st.subheader("Contract File Upload")
-        st.markdown(
-            "Upload the contract file as **PDF**, **DOCX**, or **TXT**. "
-            "Extracted text will be shown below for review."
-        )
-
-        extracted_text, status = handle_file_upload()
-
-        if status:
-            st.success(status)
-
-        st.subheader("Extracted Contract Text (editable)")
-        default_text = extracted_text or ""
-        contract_text = st.text_area(
-            label="Extracted contract text",
-            value=default_text,
-            height=350,
-            placeholder=(
-                "Once you upload a file, the extracted text will appear here. "
-                "You can review and edit it before analysis."
-            ),
-        )
-        return contract_text
-
-    st.subheader("Contract Text (Paste)")
+    st.markdown("---")
+    st.markdown("#### Notes")
     st.markdown(
-        "Paste the full contract text below. For very long contracts, you can start by "
-        "testing with key sections (e.g., scope, liabilities, payment, termination)."
+        """
+- Paste contract text or upload a file (PDF/DOCX/TXT).
+- Output is structured for dashboards and reports.
+- Zero-Retention Policy – AI co-pilot, not a law firm.
+- Results should be verified by a qualified attorney.
+        """,
+        help="This tool provides commercial insight, not legal advice.",
     )
 
-    default_sample = (
-        "This Agreement is made between Buyer and Contractor for the provision of "
-        "maintenance and support services for offshore assets..."
-    )
+# ===========================
+# Main layout – header
+# ===========================
 
+st.markdown(
+    """
+<div class="contract-title">Contract Engine</div>
+<div class="contract-subtitle">
+Licensed to: sales@jiculimited.com
+</div>
+""",
+    unsafe_allow_html=True,
+)
+
+st.markdown("### Contract File Upload" if input_mode == "Upload file" else "### Contract Text (Paste)")
+
+deal_context = ""  # reserved if you want to expose later in UI
+
+
+# ===========================
+# Contract input area
+# ===========================
+
+contract_text: Optional[str] = None
+
+if input_mode == "Paste text":
     contract_text = st.text_area(
-        label="Contract body",
-        value=default_sample,
-        height=350,
-        placeholder="Paste or type the full contract here...",
+        "Contract body",
+        height=260,
+        placeholder=(
+            "Paste the full contract text here. For very long contracts, "
+            "you can start by testing key sections (scope, liabilities, payment, termination)."
+        ),
     )
-
-    return contract_text
-
-
-# ---------------------------------------------------------
-# Dashboard-style cards
-# ---------------------------------------------------------
-def risk_border_class(risk_level: str) -> str:
-    risk_level = (risk_level or "").lower()
-    if risk_level == "high":
-        return "ce-risk-border-high"
-    if risk_level == "medium":
-        return "ce-risk-border-medium"
-    if risk_level == "low":
-        return "ce-risk-border-low"
-    return "ce-risk-border-unknown"
-
-
-def risk_level_pill_class(risk_level: str) -> str:
-    risk_level = (risk_level or "").lower()
-    if risk_level == "high":
-        return "ce-pill-risk-high"
-    if risk_level == "medium":
-        return "ce-pill-risk-medium"
-    if risk_level == "low":
-        return "ce-pill-risk-low"
-    return "ce-pill-risk-unknown"
-
-
-def render_top_summary(result: AnalysisResult):
-    kc = result.keyCommercials
-    summary_text = ""
-    if result.executiveSummary:
-        summary_text = result.executiveSummary[0].lstrip("- ").strip()
-
-    col1, col2, col3, col4 = st.columns([2.2, 1.3, 1.3, 1.3])
-
-    with col1:
-        st.markdown(
-            f"""
-<div class="ce-card ce-card-hero">
-  <div class="ce-label">Overall Risk Rating</div>
-  <div class="ce-risk-title">{result.overallRisk}</div>
-  <div style="font-size:0.85rem;color:#64748b;margin-bottom:10px;">
-    High-level risk posture based on liability, HSE, payment, termination and legal exposure.
-  </div>
-  <div style="font-size:0.9rem;color:#0f172a;line-height:1.5;">
-    {summary_text or "Executive risk summary will appear here based on the contract analysis."}
-  </div>
-</div>
-""",
-            unsafe_allow_html=True,
-        )
-
-    with col2:
-        st.markdown(
-            f"""
-<div class="ce-card">
-  <div class="ce-metric-title">Value</div>
-  <div class="ce-metric-value">{kc.value or "Not specified"}</div>
-</div>
-""",
-            unsafe_allow_html=True,
-        )
-
-    with col3:
-        st.markdown(
-            f"""
-<div class="ce-card">
-  <div class="ce-metric-title">Term</div>
-  <div class="ce-metric-value">{kc.duration or "Not specified"}</div>
-</div>
-""",
-            unsafe_allow_html=True,
-        )
-
-    with col4:
-        st.markdown(
-            f"""
-<div class="ce-card">
-  <div class="ce-metric-title">Type</div>
-  <div class="ce-metric-value">{kc.contractType or "Not specified"}</div>
-</div>
-""",
-            unsafe_allow_html=True,
-        )
-
-
-def render_strategic_risk_map(result: AnalysisResult):
-    st.markdown("<div class='ce-section-title'>Strategic Risk Map</div>", unsafe_allow_html=True)
-    st.markdown(
-        "<div class='ce-section-caption'>Synthesis of key risk categories with business impact and mitigation levers.</div>",
-        unsafe_allow_html=True,
+else:
+    uploaded = st.file_uploader(
+        "Upload contract file (PDF, DOCX, or TXT)",
+        type=["pdf", "docx", "txt"],
     )
-
-    if not result.riskMatrix:
-        st.info("No risk matrix items generated.")
-        return
-
-    by_category: Dict[str, List] = {}
-    for item in result.riskMatrix:
-        by_category.setdefault(item.category, []).append(item)
-
-    order = ["Liability", "Termination", "HSE", "Payment", "Legal"]
-    ordered_items = []
-    seen = set()
-    for cat in order:
-        if cat in by_category and by_category[cat]:
-            ordered_items.append(by_category[cat][0])
-            seen.add(cat)
-    for cat, items in by_category.items():
-        if cat not in seen:
-            ordered_items.append(items[0])
-
-    chunks = [ordered_items[i : i + 3] for i in range(0, len(ordered_items), 3)]
-
-    for chunk in chunks:
-        cols = st.columns(len(chunk))
-        for col, item in zip(cols, chunk):
-            border_class = risk_border_class(item.riskLevel)
-            pill_class = risk_level_pill_class(item.riskLevel)
-            description = item.description
-            mitigation = item.mitigation or ""
-
-            col.markdown(
-                f"""
-<div class="ce-card ce-risk-card {border_class}">
-  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
-    <div class="ce-label">{item.category.upper()}</div>
-    <span class="ce-pill {pill_class}">{item.riskLevel.upper()} RISK</span>
-  </div>
-  <div style="font-size:0.9rem;color:#0f172a;margin-bottom:6px;">
-    {description}
-  </div>
-  {"<div style='font-size:0.8rem;color:#64748b;'><strong>Mitigation focus:</strong> " + mitigation + "</div>" if mitigation else ""}
-</div>
-""",
-                unsafe_allow_html=True,
-            )
-
-
-# ---------------------------------------------------------
-# Report builders (Markdown + DOCX)
-# ---------------------------------------------------------
-def build_markdown_report(result: AnalysisResult) -> str:
-    kc = result.keyCommercials
-    comp = result.compliance
-
-    lines: List[str] = []
-
-    lines.append("# Contract Analysis Report")
-    lines.append("")
-    lines.append(f"**Overall Risk:** {result.overallRisk}")
-    lines.append("")
-    lines.append("## Executive Summary")
-    if result.executiveSummary:
-        for bullet in result.executiveSummary:
-            if bullet.strip().startswith("-"):
-                lines.append(bullet)
-            else:
-                lines.append(f"- {bullet}")
+    if uploaded is not None:
+        extracted = extract_text_from_upload(uploaded)
+        st.success(f"Extracted text from file: {uploaded.name}")
+        contract_text = st.text_area(
+            "Extracted contract text (editable)",
+            extracted,
+            height=260,
+        )
     else:
-        lines.append("- No executive summary provided.")
+        contract_text = None
+
+run_clicked = st.button("Run Analysis 🚀")
+
+# ===========================
+# Run analysis
+# ===========================
+
+if run_clicked:
+    if not st.session_state.license_ok:
+        st.error("Please validate a license key before running analysis.")
+    elif not contract_text or not contract_text.strip():
+        st.error("Please provide contract text (paste or upload a file).")
+    else:
+        with st.spinner("Running analysis with Contract Engine…"):
+            try:
+                result = analyze_contract(contract_text, role=role, deal_context=deal_context)
+                st.session_state.analysis_result = result
+                st.session_state.analysis_error = None
+            except Exception as exc:  # noqa: BLE001
+                st.session_state.analysis_result = None
+                st.session_state.analysis_error = str(exc)
+
+# ===========================
+# Error display
+# ===========================
+
+if st.session_state.analysis_error:
+    st.error("Error during analysis:")
+    st.code(st.session_state.analysis_error, language="text")
+
+
+# ===========================
+# Visualisation helpers
+# ===========================
+
+def risk_badge(level: str) -> str:
+    lvl = (level or "").lower()
+    if lvl == "low":
+        return '<span class="badge-low">LOW</span>'
+    if lvl == "high":
+        return '<span class="badge-high">HIGH</span>'
+    return '<span class="badge-medium">MEDIUM</span>'
+
+
+# ===========================
+# Report export helper
+# ===========================
+
+def build_markdown_report(result: AnalysisResult, role: str, deal_context: str) -> str:
+    kc = result.keyCommercials
+    lines = []
+
+    lines.append(f"# Contract Engine – Oil & Gas Edition\n")
+    lines.append(f"Perspective: **{role.title()}**\n")
+    if deal_context:
+        lines.append(f"Context: {deal_context}\n")
+
+    lines.append("## Overall Risk\n")
+    lines.append(f"- Overall risk rating: **{result.overallRisk}**\n")
+
+    lines.append("## Key Commercial Terms\n")
+    lines.append(f"- **Contract type:** {kc.contractType}")
+    lines.append(f"- **Value / pricing basis:** {kc.value}")
+    lines.append(f"- **Pricing model:** {kc.pricingModel}")
+    lines.append(f"- **Duration / term:** {kc.duration}")
+    lines.append(f"- **Renewal / extension:** {kc.renewalTerms}\n")
+
+    lines.append("## Executive Summary\n")
+    for bullet in result.executiveSummary:
+        lines.append(f"- {bullet}")
     lines.append("")
 
-    lines.append("## Key Commercial Profile")
-    lines.append(f"- **Value:** {kc.value or 'Not specified'}")
-    lines.append(f"- **Duration / Term:** {kc.duration or 'Not specified'}")
-    lines.append(f"- **Contract Type:** {kc.contractType or 'Not specified'}")
-    lines.append(f"- **Pricing Model:** {kc.pricingModel or 'Not specified'}")
-    if kc.renewalTerms:
-        lines.append(f"- **Renewal Terms:** {kc.renewalTerms}")
+    lines.append("## Strategic Risk Map\n")
+    lines.append("| Category | Risk level | Description | Mitigation |")
+    lines.append("| --- | --- | --- | --- |")
+    for item in result.riskMatrix:
+        lines.append(
+            f"| {item.category} | {item.riskLevel} | {item.description} | {item.mitigation} |"
+        )
     lines.append("")
 
-    lines.append("## Compliance & Counterparty View")
-    lines.append(f"- **Overall Compliance Risk:** {comp.overallComplianceRisk}")
-    lines.append(f"- **Summary:** {comp.summary}")
-    if comp.financialSignals:
-        lines.append("- **Financial Signals:**")
-        for s in comp.financialSignals:
-            lines.append(f"  - {s}")
-    if comp.sanctionsFlags:
-        lines.append("- **Sanctions Flags:**")
-        for s in comp.sanctionsFlags:
-            lines.append(f"  - {s}")
-    if comp.adverseMedia:
-        lines.append("- **Adverse Media:**")
-        for s in comp.adverseMedia:
-            lines.append(f"  - {s}")
-    lines.append("")
+    lines.append("## Commercial & Financial Profile\n")
+    lines.append(f"- Payment terms & structure: {result.scope.paymentTerms}")
+    lines.append(f"- Pricing and billing logic: {result.scope.pricingModel}")
+    lines.append(f"- Deliverables / outputs: {result.scope.deliverables}\n")
 
-    lines.append("## Detailed McKinsey-Style Deep Dive")
-    lines.append(result.detailedAnalysis or "_No detailed analysis provided._")
+    lines.append("## Scope of Work & Technical Overview\n")
+    lines.append(result.automated_risk_review + "\n")
+
+    lines.append("## Vendor Intelligence\n")
+    lines.append(result.vendor_intelligence + "\n")
+
+    lines.append("## Negotiation Coach\n")
+    lines.append(result.negotiation_coach + "\n")
+
+    lines.append("## Executive Insights\n")
+    lines.append(result.executive_insights + "\n")
+
+    lines.append("## Detailed Deep-Dive Analysis\n")
+    lines.append(result.detailedAnalysis + "\n")
 
     return "\n".join(lines)
 
 
-def build_docx_report(result: AnalysisResult) -> bytes:
-    kc = result.keyCommercials
-    comp = result.compliance
+# ===========================
+# Main dashboard output
+# ===========================
 
-    doc = Document()
+result: Optional[AnalysisResult] = st.session_state.analysis_result
 
-    doc.add_heading("Contract Analysis Report", level=1)
-    doc.add_paragraph(f"Overall Risk: {result.overallRisk}")
+if result:
+    # ---- Top cards: overall risk & key terms ----
+    st.markdown("### Deal Snapshot")
 
-    doc.add_heading("Executive Summary", level=2)
-    if result.executiveSummary:
-        for bullet in result.executiveSummary:
-            doc.add_paragraph(bullet.lstrip("- ").strip(), style="List Bullet")
-    else:
-        doc.add_paragraph("No executive summary provided.")
+    col1, col2, col3, col4 = st.columns([1.5, 1.2, 1.2, 1.2])
 
-    doc.add_heading("Key Commercial Profile", level=2)
-    doc.add_paragraph(f"Value: {kc.value or 'Not specified'}")
-    doc.add_paragraph(f"Duration / Term: {kc.duration or 'Not specified'}")
-    doc.add_paragraph(f"Contract Type: {kc.contractType or 'Not specified'}")
-    doc.add_paragraph(f"Pricing Model: {kc.pricingModel or 'Not specified'}")
-    if kc.renewalTerms:
-        doc.add_paragraph(f"Renewal Terms: {kc.renewalTerms}")
-
-    doc.add_heading("Compliance & Counterparty View", level=2)
-    doc.add_paragraph(f"Overall Compliance Risk: {comp.overallComplianceRisk}")
-    doc.add_paragraph(f"Summary: {comp.summary}")
-    if comp.financialSignals:
-        doc.add_paragraph("Financial Signals:")
-        for s in comp.financialSignals:
-            doc.add_paragraph(s, style="List Bullet")
-    if comp.sanctionsFlags:
-        doc.add_paragraph("Sanctions Flags:")
-        for s in comp.sanctionsFlags:
-            doc.add_paragraph(s, style="List Bullet")
-    if comp.adverseMedia:
-        doc.add_paragraph("Adverse Media:")
-        for s in comp.adverseMedia:
-            doc.add_paragraph(s, style="List Bullet")
-
-    doc.add_heading("Detailed McKinsey-Style Deep Dive", level=2)
-    for line in (result.detailedAnalysis or "").splitlines():
-        if not line.strip():
-            doc.add_paragraph("")
-        else:
-            doc.add_paragraph(line)
-
-    buffer = io.BytesIO()
-    doc.save(buffer)
-    buffer.seek(0)
-    return buffer.read()
-
-
-def render_download_section(result: AnalysisResult):
-    st.markdown("### Export Report")
-    md_report = build_markdown_report(result)
-    docx_bytes = build_docx_report(result)
-
-    col1, col2 = st.columns(2)
     with col1:
-        st.download_button(
-            label="Download Markdown Report",
-            data=md_report.encode("utf-8"),
-            file_name="contract_analysis_report.md",
-            mime="text/markdown",
+        st.markdown('<div class="ce-card">', unsafe_allow_html=True)
+        st.markdown('<div class="label-muted">OVERALL RISK RATING</div>', unsafe_allow_html=True)
+        st.markdown(
+            f"<h2 style='margin:0.2rem 0 0.3rem 0;'>{result.overallRisk}</h2>",
+            unsafe_allow_html=True,
         )
-    with col2:
-        st.download_button(
-            label="Download Word Report (.docx)",
-            data=docx_bytes,
-            file_name="contract_analysis_report.docx",
-            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        )
-
-
-# ---------------------------------------------------------
-# Main app
-# ---------------------------------------------------------
-def main():
-    inject_css()
-    render_header()
-    api_key = ensure_api_key()
-    settings = render_sidebar()
-    contract_text = render_input_area(settings["input_mode"])
-
-    if settings["run_button"]:
-        if not api_key:
-            st.stop()
-
-        if not st.session_state.get("license_valid", False) and gumroad_license_enforced():
-            st.error("Please enter and validate your Gumroad license key before running the analysis.")
-            st.stop()
-
-        if not contract_text.strip():
-            st.error("Please provide contract text (paste or from upload) before running analysis.")
-            st.stop()
-
-        with st.spinner("Running analysis with Contract Engine…"):
-            try:
-                result: AnalysisResult = analyze_contract(
-                    contract_text=contract_text,
-                    party_role=settings["party_role"],
-                    deal_context=None,
-                )
-            except Exception as e:
-                st.error(f"Error during analysis: {e}")
-                st.stop()
-
-        st.markdown("<div class='report-container'>", unsafe_allow_html=True)
-
-        render_top_summary(result)
-        st.markdown("<br>", unsafe_allow_html=True)
-        render_strategic_risk_map(result)
-        st.markdown("<hr style='margin:32px 0;'>", unsafe_allow_html=True)
-
-        st.markdown("### Executive Summary")
-        if result.executiveSummary:
-            for bullet in result.executiveSummary:
-                if bullet.strip().startswith("-"):
-                    st.markdown(bullet)
-                else:
-                    st.markdown(f"- {bullet}")
-        else:
-            st.info("No executive summary generated.")
-
-        st.markdown("### Detailed McKinsey-Style Deep Dive")
-        st.markdown(result.detailedAnalysis)
-
-        if settings["show_json"]:
-            st.markdown("---")
-            st.subheader("Raw JSON Output")
-            st.json(result.dict())
-
-        st.markdown("---")
-        render_download_section(result)
-
+        st.write(result.executiveSummary[0] if result.executiveSummary else "")
         st.markdown("</div>", unsafe_allow_html=True)
 
+    kc = result.keyCommercials
 
-if __name__ == "__main__":
-    main()
+    with col2:
+        st.markdown('<div class="ce-card">', unsafe_allow_html=True)
+        st.markdown('<div class="label-muted">VALUE / PRICING</div>', unsafe_allow_html=True)
+        st.write(kc.value or "Not specified")
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    with col3:
+        st.markdown('<div class="ce-card">', unsafe_allow_html=True)
+        st.markdown('<div class="label-muted">TERM</div>', unsafe_allow_html=True)
+        st.write(kc.duration or "Not specified")
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    with col4:
+        st.markdown('<div class="ce-card">', unsafe_allow_html=True)
+        st.markdown('<div class="label-muted">CONTRACT TYPE</div>', unsafe_allow_html=True)
+        st.write(kc.contractType or "Not specified")
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    # ---- Executive summary & deep dive ----
+    st.markdown('<div class="section-title">Executive Summary</div>', unsafe_allow_html=True)
+    for bullet in result.executiveSummary:
+        st.markdown(f"- {bullet}")
+
+    st.markdown('<div class="section-title">Commercial & Financial Profile</div>', unsafe_allow_html=True)
+    st.markdown(f"**Contract value / basis:** {kc.value}")
+    st.markdown(f"**Pricing model:** {kc.pricingModel}")
+    st.markdown(f"**Payment terms:** {result.scope.paymentTerms}")
+    st.markdown(f"**Duration:** {kc.duration}")
+    st.markdown(f"**Renewal / options:** {kc.renewalTerms}")
+
+    st.markdown('<div class="section-title">Scope of Work & Technical Review</div>', unsafe_allow_html=True)
+    st.markdown(f"**Deliverables / services:** {result.scope.deliverables}")
+    st.markdown(result.automated_risk_review)
+
+    # ---- Strategic Risk Map ----
+    st.markdown('<div class="section-title">Strategic Risk Map</div>', unsafe_allow_html=True)
+
+    # Show risk items as cards
+    cols = st.columns(2)
+    for idx, item in enumerate(result.riskMatrix):
+        col = cols[idx % 2]
+        with col:
+            st.markdown('<div class="ce-card">', unsafe_allow_html=True)
+            st.markdown(
+                f"<div class='label-muted'>{item.category}</div>",
+                unsafe_allow_html=True,
+            )
+            st.markdown(risk_badge(item.riskLevel), unsafe_allow_html=True)
+            st.write(item.description)
+            st.markdown(f"**Mitigation:** {item.mitigation}")
+            st.markdown("</div>", unsafe_allow_html=True)
+
+    # ---- Vendor intelligence & negotiation ----
+    st.markdown('<div class="section-title">Vendor & Counterparty Intelligence</div>', unsafe_allow_html=True)
+    st.markdown(result.vendor_intelligence)
+
+    st.markdown('<div class="section-title">Negotiation Coach</div>', unsafe_allow_html=True)
+    st.markdown(result.negotiation_coach)
+
+    st.markdown('<div class="section-title">Executive Insights</div>', unsafe_allow_html=True)
+    st.markdown(result.executive_insights)
+
+    # ---- Download report ----
+    st.markdown('<div class="section-title">Export Report</div>', unsafe_allow_html=True)
+    md_report = build_markdown_report(result, role=role, deal_context=deal_context)
+    buffer = io.BytesIO(md_report.encode("utf-8"))
+    st.download_button(
+        label="Download Report (.md)",
+        data=buffer,
+        file_name="contract_engine_report.md",
+        mime="text/markdown",
+    )
+
+    # ---- Raw JSON (optional) ----
+    if show_raw_json:
+        st.markdown("### Raw JSON Output")
+        st.code(result.model_dump_json(indent=2), language="json")
